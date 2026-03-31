@@ -8,15 +8,18 @@ Endpoints:
 - GET /split — train/test split boundary info
 - GET /symbols — configured symbols
 - POST /sync/{symbol} — trigger manual sync
+- GET /testnet/portfolio — testnet account summary
+- GET /testnet/balance/{asset} — testnet balance for asset
+- GET /testnet/trades — trade log this session
+- POST /testnet/execute/{symbol} — execute regime signal on testnet
 """
 import os
 import json
-import math
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Regime Terminal", version="1.0.0")
+app = FastAPI(title="Regime Terminal", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,6 +34,8 @@ def get_conn():
     import psycopg2
     return psycopg2.connect(NEON_URI)
 
+
+# ========== REGIME ENDPOINTS ==========
 
 @app.get("/health")
 def health():
@@ -129,6 +134,70 @@ def sync_symbol(symbol: str, days_back: int = 1):
     total = cur.fetchone()[0]
     cur.close(); conn.close()
     return {"symbol": symbol, "fetched": len(raw), "total": total}
+
+
+# ========== TESTNET PAPER TRADING ENDPOINTS ==========
+
+@app.get("/testnet/portfolio")
+def testnet_portfolio():
+    from src.paper_trade import get_portfolio_summary
+    return get_portfolio_summary()
+
+
+@app.get("/testnet/balance/{asset}")
+def testnet_balance(asset: str):
+    from src.paper_trade import get_balance
+    return get_balance(asset.upper())
+
+
+@app.get("/testnet/trades")
+def testnet_trades():
+    from src.paper_trade import get_trade_log
+    return {"trades": get_trade_log(), "count": len(get_trade_log())}
+
+
+@app.post("/testnet/execute/{symbol}")
+def testnet_execute(symbol: str):
+    """Get current regime for symbol and execute signal on testnet."""
+    from src.paper_trade import execute_signal
+    from src.strategy import strategy_fn
+    from src.regime import classify
+
+    symbol = symbol.upper()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT open_time, open, high, low, close, volume FROM candles WHERE symbol=%s AND interval='1m' ORDER BY open_time DESC LIMIT 100", (symbol,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    if len(rows) < 15:
+        raise HTTPException(status_code=400, detail=f"Not enough data for {symbol}")
+
+    rows = list(reversed(rows))
+    closes = [r[4] for r in rows]
+    volumes = [r[5] for r in rows]
+    regime, confidence = classify(closes, volumes, len(rows) - 1)
+
+    state = {}
+    candle = rows[-1]
+    signal = strategy_fn(candle, regime, confidence, state)
+
+    result = execute_signal(symbol, signal)
+
+    return {
+        "symbol": symbol,
+        "regime": regime,
+        "confidence": confidence,
+        "signal": signal,
+        "execution": result,
+    }
+
+
+@app.get("/testnet/price/{symbol}")
+def testnet_price(symbol: str):
+    from src.paper_trade import get_price
+    price = get_price(symbol.upper())
+    return {"symbol": symbol.upper(), "price": price}
 
 
 if __name__ == "__main__":
