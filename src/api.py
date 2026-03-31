@@ -2,24 +2,25 @@
 Regime Terminal API — Railway service entry point.
 
 Endpoints:
-- GET /health — service status + candle counts
-- GET /regimes — current regime state for all symbols
-- GET /regimes/{symbol} — regime + candles for a specific symbol
-- GET /split — train/test split boundary info
-- GET /symbols — configured symbols
-- POST /sync/{symbol} — trigger manual sync
-- GET /testnet/portfolio — testnet account summary
-- GET /testnet/balance/{asset} — testnet balance for asset
-- GET /testnet/trades — trade log this session
-- POST /testnet/execute/{symbol} — execute regime signal on testnet
+- GET /health
+- GET /regimes, /regimes/{symbol}
+- GET /split, /symbols
+- POST /sync/{symbol}
+- GET /testnet/portfolio, /testnet/balance/{asset}, /testnet/trades
+- POST /testnet/execute/{symbol}
+- GET /portfolio, /portfolio/pnl, /portfolio/allocations, /portfolio/history
+- POST /portfolio/open, /portfolio/close/{position_id}
+- PUT /portfolio/allocations/{strategy}
 """
 import os
 import json
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
 
-app = FastAPI(title="Regime Terminal", version="1.1.0")
+app = FastAPI(title="Regime Terminal", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,13 +36,37 @@ def get_conn():
     return psycopg2.connect(NEON_URI)
 
 
+# ========== REQUEST MODELS ==========
+
+class OpenPositionRequest(BaseModel):
+    symbol: str
+    side: str
+    quantity: float
+    entry_price: float
+    strategy: str = "regime"
+    regime: Optional[int] = None
+    confidence: Optional[float] = None
+    notes: Optional[str] = None
+    execute: bool = True
+
+class ClosePositionRequest(BaseModel):
+    exit_price: float
+    notes: Optional[str] = None
+    execute: bool = True
+
+class UpdateAllocationRequest(BaseModel):
+    target_pct: Optional[float] = None
+    max_position_pct: Optional[float] = None
+    max_positions: Optional[int] = None
+    enabled: Optional[bool] = None
+
+
 # ========== REGIME ENDPOINTS ==========
 
 @app.get("/health")
 def health():
     try:
-        conn = get_conn()
-        cur = conn.cursor()
+        conn = get_conn(); cur = conn.cursor()
         cur.execute("SELECT symbol, COUNT(*) FROM candles GROUP BY symbol ORDER BY symbol")
         counts = {r[0]: r[1] for r in cur.fetchall()}
         cur.execute("SELECT COUNT(*) FROM candles")
@@ -54,8 +79,7 @@ def health():
 
 @app.get("/regimes")
 def regimes():
-    conn = get_conn()
-    cur = conn.cursor()
+    conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT DISTINCT ON (symbol) symbol, open_time, close, regime, confidence FROM candles ORDER BY symbol, open_time DESC")
     rows = cur.fetchall()
     cur.close(); conn.close()
@@ -68,8 +92,7 @@ def regimes():
 
 @app.get("/regimes/{symbol}")
 def regime_detail(symbol: str, limit: int = 1440):
-    conn = get_conn()
-    cur = conn.cursor()
+    conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT open_time, open, high, low, close, volume, regime, confidence FROM candles WHERE symbol=%s AND interval='1m' ORDER BY open_time DESC LIMIT %s", (symbol.upper(), limit))
     rows = cur.fetchall()
     cur.close(); conn.close()
@@ -81,9 +104,9 @@ def regime_detail(symbol: str, limit: int = 1440):
 
 @app.get("/split")
 def split_info():
-    from src.evaluate import SPLIT_MS, SPLIT_LABEL
-    conn = get_conn()
-    cur = conn.cursor()
+    SPLIT_MS = 1753833600000
+    SPLIT_LABEL = "2025-08-01"
+    conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM candles WHERE open_time < %s", (SPLIT_MS,))
     train = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM candles WHERE open_time >= %s", (SPLIT_MS,))
@@ -103,7 +126,6 @@ def sync_symbol(symbol: str, days_back: int = 1):
     import httpx
     from io import StringIO
     import psycopg2
-    from src.regime import classify
     symbol = symbol.upper()
     now = datetime.now(timezone.utc)
     start_ms = int((now - timedelta(days=days_back)).timestamp() * 1000)
@@ -115,20 +137,38 @@ def sync_symbol(symbol: str, days_back: int = 1):
     raw = resp.json()
     if not raw:
         return {"symbol": symbol, "fetched": 0}
+    import math
     closes = [float(k[4]) for k in raw]
     volumes = [float(k[5]) for k in raw]
     buf = StringIO()
+    w = 14
     for i, k in enumerate(raw):
-        r, cf = classify(closes, volumes, i)
-        buf.write(f"{symbol}\t1m\t{k[0]}\t{k[1]}\t{k[2]}\t{k[3]}\t{k[4]}\t{k[5]}\t{k[7]}\t{k[8]}\t{r}\t{round(cf, 3)}\t0\t0\t0\n")
+        r, cf = 3, 0.5
+        if i >= w:
+            rets = [(closes[j]-closes[j-1])/closes[j-1] for j in range(max(1,i-w+1),i+1) if closes[j-1]>0]
+            if rets:
+                ar = sum(rets)/len(rets)
+                vo = math.sqrt(sum((x-ar)**2 for x in rets)/len(rets)) if len(rets)>1 else 0
+                av = sum(volumes[max(0,i-w):i+1])/min(w+1,i+1)
+                vr = volumes[i]/av if av>0 else 1
+                sc = ar*10000
+                if vo>0.03: sc-=2
+                if vr>2: sc+=1 if sc>0 else -1
+                if sc>3: r,cf=0,min(.95,.6+sc*.03)
+                elif sc>1.5: r,cf=1,min(.97,.55+sc*.05)
+                elif sc>.3: r,cf=2,min(.97,.5+sc*.08)
+                elif sc>-.3: r,cf=3,min(.97,.4+abs(sc)*.1)
+                elif sc>-1.5: r,cf=4,min(.97,.5+abs(sc)*.08)
+                elif sc>-3: r,cf=5,min(.97,.55+abs(sc)*.05)
+                else: r,cf=6,min(.95,.6+abs(sc)*.03)
+        buf.write(f"{symbol}\t1m\t{k[0]}\t{k[1]}\t{k[2]}\t{k[3]}\t{k[4]}\t{k[5]}\t{k[7]}\t{k[8]}\t{r}\t{round(cf,3)}\t0\t0\t0\n")
     buf.seek(0)
-    conn = psycopg2.connect(NEON_URI)
-    cur = conn.cursor()
+    conn = psycopg2.connect(NEON_URI); cur = conn.cursor()
     cur.execute("CREATE TEMP TABLE tmp (LIKE candles INCLUDING DEFAULTS) ON COMMIT DROP")
     cur.execute("ALTER TABLE tmp DROP COLUMN id, DROP COLUMN created_at")
-    cur.copy_from(buf, 'tmp', columns=['symbol', 'interval', 'open_time', 'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trades', 'regime', 'confidence', 'returns', 'volatility', 'volume_ratio'])
-    cur.execute("""INSERT INTO candles (symbol, interval, open_time, open, high, low, close, volume, quote_volume, trades, regime, confidence, returns, volatility, volume_ratio)
-        SELECT * FROM tmp ON CONFLICT (symbol, interval, open_time) DO NOTHING""")
+    cur.copy_from(buf, 'tmp', columns=['symbol','interval','open_time','open','high','low','close','volume','quote_volume','trades','regime','confidence','returns','volatility','volume_ratio'])
+    cur.execute("""INSERT INTO candles (symbol,interval,open_time,open,high,low,close,volume,quote_volume,trades,regime,confidence,returns,volatility,volume_ratio)
+        SELECT * FROM tmp ON CONFLICT (symbol,interval,open_time) DO NOTHING""")
     conn.commit()
     cur.execute("SELECT COUNT(*) FROM candles WHERE symbol=%s", (symbol,))
     total = cur.fetchone()[0]
@@ -143,61 +183,87 @@ def testnet_portfolio():
     from src.paper_trade import get_portfolio_summary
     return get_portfolio_summary()
 
-
 @app.get("/testnet/balance/{asset}")
 def testnet_balance(asset: str):
     from src.paper_trade import get_balance
     return get_balance(asset.upper())
-
 
 @app.get("/testnet/trades")
 def testnet_trades():
     from src.paper_trade import get_trade_log
     return {"trades": get_trade_log(), "count": len(get_trade_log())}
 
-
-@app.post("/testnet/execute/{symbol}")
-def testnet_execute(symbol: str):
-    """Get current regime for symbol and execute signal on testnet."""
-    from src.paper_trade import execute_signal
-    from src.strategy import strategy_fn
-    from src.regime import classify
-
-    symbol = symbol.upper()
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT open_time, open, high, low, close, volume FROM candles WHERE symbol=%s AND interval='1m' ORDER BY open_time DESC LIMIT 100", (symbol,))
-    rows = cur.fetchall()
-    cur.close(); conn.close()
-
-    if len(rows) < 15:
-        raise HTTPException(status_code=400, detail=f"Not enough data for {symbol}")
-
-    rows = list(reversed(rows))
-    closes = [r[4] for r in rows]
-    volumes = [r[5] for r in rows]
-    regime, confidence = classify(closes, volumes, len(rows) - 1)
-
-    state = {}
-    candle = rows[-1]
-    signal = strategy_fn(candle, regime, confidence, state)
-
-    result = execute_signal(symbol, signal)
-
-    return {
-        "symbol": symbol,
-        "regime": regime,
-        "confidence": confidence,
-        "signal": signal,
-        "execution": result,
-    }
-
-
 @app.get("/testnet/price/{symbol}")
 def testnet_price(symbol: str):
     from src.paper_trade import get_price
-    price = get_price(symbol.upper())
-    return {"symbol": symbol.upper(), "price": price}
+    return {"symbol": symbol.upper(), "price": get_price(symbol.upper())}
+
+
+# ========== PORTFOLIO MANAGEMENT ENDPOINTS ==========
+
+@app.get("/portfolio")
+def portfolio():
+    from src.portfolio import get_book
+    positions = get_book()
+    return {"positions": positions, "count": len(positions)}
+
+
+@app.post("/portfolio/open")
+def portfolio_open(req: OpenPositionRequest):
+    from src.portfolio import open_position
+    result = open_position(
+        symbol=req.symbol, side=req.side, quantity=req.quantity,
+        entry_price=req.entry_price, strategy=req.strategy,
+        regime=req.regime, confidence=req.confidence,
+        notes=req.notes, execute=req.execute
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/portfolio/close/{position_id}")
+def portfolio_close(position_id: int, req: ClosePositionRequest):
+    from src.portfolio import close_position
+    result = close_position(
+        position_id=position_id, exit_price=req.exit_price,
+        notes=req.notes, execute=req.execute
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.get("/portfolio/pnl")
+def portfolio_pnl(strategy: Optional[str] = None):
+    from src.portfolio import get_pnl
+    return get_pnl(strategy)
+
+
+@app.get("/portfolio/allocations")
+def portfolio_allocations():
+    from src.portfolio import get_allocations
+    return {"allocations": get_allocations()}
+
+
+@app.put("/portfolio/allocations/{strategy}")
+def portfolio_update_allocation(strategy: str, req: UpdateAllocationRequest):
+    from src.portfolio import update_allocation
+    result = update_allocation(
+        strategy=strategy, target_pct=req.target_pct,
+        max_position_pct=req.max_position_pct,
+        max_positions=req.max_positions, enabled=req.enabled
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.get("/portfolio/history")
+def portfolio_history(limit: int = 50, strategy: Optional[str] = None):
+    from src.portfolio import get_trade_history
+    trades = get_trade_history(limit=limit, strategy=strategy)
+    return {"trades": trades, "count": len(trades)}
 
 
 if __name__ == "__main__":
