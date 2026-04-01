@@ -67,38 +67,22 @@ def _compute_features_raw(closes, volumes, window=WINDOW):
 
 
 def train(closes, volumes, n_states=N_STATES, window=WINDOW, max_iter=200):
-    """Train HMM on historical data.
-    Returns: (model, scaler, state_map)
-    """
+    """Train HMM on historical data. Returns (model, scaler, state_map)."""
     if GaussianHMM is None:
-        raise ImportError("hmmlearn not installed. Run: pip install hmmlearn")
+        raise ImportError("hmmlearn not installed")
     if StandardScaler is None:
-        raise ImportError("scikit-learn not installed. Run: pip install scikit-learn")
-
+        raise ImportError("scikit-learn not installed")
     X_raw, _ = _compute_features_raw(closes, volumes, window)
     if X_raw is None or len(X_raw) < 100:
         raise ValueError(f"Not enough data. Got {len(closes)} candles, need {window + 100}+")
-
-    # Standardize features — critical for HMM convergence
     scaler = StandardScaler()
     X = scaler.fit_transform(X_raw)
-
-    model = GaussianHMM(
-        n_components=n_states,
-        covariance_type="diag",
-        n_iter=max_iter,
-        random_state=42,
-        min_covar=1e-3,
-        tol=1e-4,
-    )
+    model = GaussianHMM(n_components=n_states, covariance_type="diag",
+                        n_iter=max_iter, random_state=42, min_covar=1e-3, tol=1e-4)
     model.fit(X)
-
-    # Order states by mean return (col 0 in standardized space)
-    # Highest = Strong Bull, lowest = Crash
     mean_returns = model.means_[:, 0]
     sorted_indices = np.argsort(-mean_returns)
     state_map = {int(raw): regime_id for regime_id, raw in enumerate(sorted_indices)}
-
     return model, scaler, state_map
 
 
@@ -126,10 +110,7 @@ def load_model():
 
 
 def classify(closes, volumes, idx, window=WINDOW, model=None, scaler=None, state_map=None):
-    """Classify regime at a specific index.
-    Falls back to deterministic scorer if no trained model.
-    Returns: (regime_id, confidence)
-    """
+    """Classify regime at a specific index. Falls back to deterministic if no model."""
     if idx < window:
         return 3, 0.5
     if model is None or scaler is None or state_map is None:
@@ -137,12 +118,10 @@ def classify(closes, volumes, idx, window=WINDOW, model=None, scaler=None, state
             model, scaler, state_map = load_model()
         except (FileNotFoundError, Exception):
             return _classify_deterministic(closes, volumes, idx, window)
-
     start = max(0, idx - window * 2)
     X_raw, _ = _compute_features_raw(closes[start:idx + 1], volumes[start:idx + 1], window)
     if X_raw is None or len(X_raw) == 0:
         return 3, 0.5
-
     X = scaler.transform(X_raw)
     _, state_seq = model.decode(X, algorithm="viterbi")
     raw_state = state_seq[-1]
@@ -159,15 +138,12 @@ def classify_sequence(closes, volumes, model=None, scaler=None, state_map=None, 
             model, scaler, state_map = load_model()
         except (FileNotFoundError, Exception):
             return [_classify_deterministic(closes, volumes, i, window) for i in range(len(closes))]
-
     X_raw, valid_start = _compute_features_raw(closes, volumes, window)
     if X_raw is None:
         return [(3, 0.5)] * len(closes)
-
     X = scaler.transform(X_raw)
     _, state_seq = model.decode(X, algorithm="viterbi")
     posteriors = model.predict_proba(X)
-
     results = [(3, 0.5)] * valid_start
     for i, raw_state in enumerate(state_seq):
         regime_id = state_map.get(int(raw_state), 3)
@@ -187,7 +163,8 @@ def get_transition_matrix(model=None, state_map=None):
     for fr in range(n):
         for to in range(n):
             ordered[fr, to] = raw[inv_map[fr], inv_map[to]]
-    return {"matrix": ordered.tolist(), "labels": [r["name"] for r in REGIMES]}
+    return {"matrix": [[round(p, 4) for p in row] for row in ordered.tolist()],
+            "labels": [r["name"] for r in REGIMES]}
 
 
 def get_state_characteristics(model=None, scaler=None, state_map=None):
@@ -199,7 +176,6 @@ def get_state_characteristics(model=None, scaler=None, state_map=None):
     states = {}
     for rid in range(N_STATES):
         raw = inv_map[rid]
-        # Unstandardize means
         orig_means = model.means_[raw] * scaler.scale_ + scaler.mean_
         states[REGIMES[rid]["name"]] = {
             "regime_id": rid,
@@ -232,7 +208,7 @@ def _classify_deterministic(closes, volumes, idx, window=WINDOW):
     return 6, min(0.95, 0.6 + abs(score) * 0.03)
 
 
-def train_from_db(symbol="BTCUSDT", neon_uri=None):
+def train_from_db(symbol="BTCUSDT", neon_uri=None, limit=50000):
     """Train HMM on data from Neon PostgreSQL."""
     import psycopg2
     if neon_uri is None:
@@ -240,10 +216,10 @@ def train_from_db(symbol="BTCUSDT", neon_uri=None):
     conn = psycopg2.connect(neon_uri)
     cur = conn.cursor()
     if symbol == "ALL":
-        cur.execute("SELECT close, volume FROM candles WHERE interval='1m' ORDER BY open_time")
+        cur.execute("SELECT close, volume FROM candles WHERE interval='1m' ORDER BY open_time DESC LIMIT %s", (limit,))
     else:
-        cur.execute("SELECT close, volume FROM candles WHERE symbol=%s AND interval='1m' ORDER BY open_time", (symbol,))
-    rows = cur.fetchall()
+        cur.execute("SELECT close, volume FROM candles WHERE symbol=%s AND interval='1m' ORDER BY open_time DESC LIMIT %s", (symbol, limit))
+    rows = list(reversed(cur.fetchall()))
     cur.close(); conn.close()
     if len(rows) < 1000:
         return {"error": f"Not enough data: {len(rows)} candles"}
