@@ -1,16 +1,13 @@
 """
-7-State Gaussian HMM Regime Classifier
+Multi-Timeframe Gaussian HMM Regime Classifier
 
-Uses hmmlearn's GaussianHMM trained on historical price data.
-- Baum-Welch algorithm for learning transition/emission parameters
-- Viterbi algorithm for most likely state inference
-- StandardScaler for feature normalization (critical for convergence)
-- Genuine probabilistic confidence from posterior probabilities
+Trains separate HMMs for 1-minute, 1-hour, and 4-hour timeframes.
+- 1m: Execution timing (when to enter/exit)
+- 1h: Signal confirmation (is the transition real?)
+- 4h: Regime detection (primary trading decisions)
 
-Features: log returns, realised volatility, volume ratio
-States ordered post-training by mean return:
-  0=Strong Bull, 1=Bull, 2=Weak Bull, 3=Neutral,
-  4=Weak Bear, 5=Bear, 6=Crash
+Each timeframe has its own model, scaler, and state map.
+Baum-Welch for training, Viterbi for inference, StandardScaler for normalization.
 """
 import os
 import math
@@ -32,9 +29,7 @@ except ImportError:
 N_STATES = 7
 WINDOW = 14
 MODEL_DIR = Path(__file__).parent.parent / "models"
-MODEL_PATH = MODEL_DIR / "hmm_regime.pkl"
-SCALER_PATH = MODEL_DIR / "hmm_scaler.pkl"
-STATE_MAP_PATH = MODEL_DIR / "hmm_state_map.json"
+VALID_TIMEFRAMES = ["1m", "1h", "4h"]
 
 REGIMES = [
     {"id": 0, "name": "Strong Bull", "action": "Aggressive Long"},
@@ -47,8 +42,15 @@ REGIMES = [
 ]
 
 
+def _model_paths(timeframe="1m"):
+    return (
+        MODEL_DIR / f"hmm_regime_{timeframe}.pkl",
+        MODEL_DIR / f"hmm_scaler_{timeframe}.pkl",
+        MODEL_DIR / f"hmm_state_map_{timeframe}.json",
+    )
+
+
 def _compute_features_raw(closes, volumes, window=WINDOW):
-    """Compute raw feature matrix: [log_return, realised_vol, volume_ratio]."""
     n = len(closes)
     if n < window + 1:
         return None, 0
@@ -67,7 +69,6 @@ def _compute_features_raw(closes, volumes, window=WINDOW):
 
 
 def train(closes, volumes, n_states=N_STATES, window=WINDOW, max_iter=200):
-    """Train HMM on historical data. Returns (model, scaler, state_map)."""
     if GaussianHMM is None:
         raise ImportError("hmmlearn not installed")
     if StandardScaler is None:
@@ -86,36 +87,29 @@ def train(closes, volumes, n_states=N_STATES, window=WINDOW, max_iter=200):
     return model, scaler, state_map
 
 
-def save_model(model, scaler, state_map):
-    """Save trained model, scaler, and state map to disk."""
+def save_model(model, scaler, state_map, timeframe="1m"):
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump(model, f)
-    with open(SCALER_PATH, "wb") as f:
-        pickle.dump(scaler, f)
-    with open(STATE_MAP_PATH, "w") as f:
-        json.dump(state_map, f)
-    return str(MODEL_PATH)
+    mp, sp, smp = _model_paths(timeframe)
+    with open(mp, "wb") as f: pickle.dump(model, f)
+    with open(sp, "wb") as f: pickle.dump(scaler, f)
+    with open(smp, "w") as f: json.dump(state_map, f)
+    return str(mp)
 
 
-def load_model():
-    """Load trained model, scaler, and state map from disk."""
-    with open(MODEL_PATH, "rb") as f:
-        model = pickle.load(f)
-    with open(SCALER_PATH, "rb") as f:
-        scaler = pickle.load(f)
-    with open(STATE_MAP_PATH, "r") as f:
-        state_map = {int(k): v for k, v in json.load(f).items()}
+def load_model(timeframe="1m"):
+    mp, sp, smp = _model_paths(timeframe)
+    with open(mp, "rb") as f: model = pickle.load(f)
+    with open(sp, "rb") as f: scaler = pickle.load(f)
+    with open(smp, "r") as f: state_map = {int(k): v for k, v in json.load(f).items()}
     return model, scaler, state_map
 
 
-def classify(closes, volumes, idx, window=WINDOW, model=None, scaler=None, state_map=None):
-    """Classify regime at a specific index. Falls back to deterministic if no model."""
+def classify(closes, volumes, idx, window=WINDOW, model=None, scaler=None, state_map=None, timeframe="1m"):
     if idx < window:
         return 3, 0.5
     if model is None or scaler is None or state_map is None:
         try:
-            model, scaler, state_map = load_model()
+            model, scaler, state_map = load_model(timeframe)
         except (FileNotFoundError, Exception):
             return _classify_deterministic(closes, volumes, idx, window)
     start = max(0, idx - window * 2)
@@ -131,11 +125,10 @@ def classify(closes, volumes, idx, window=WINDOW, model=None, scaler=None, state
     return regime_id, round(confidence, 3)
 
 
-def classify_sequence(closes, volumes, model=None, scaler=None, state_map=None, window=WINDOW):
-    """Classify regime for an entire sequence efficiently."""
+def classify_sequence(closes, volumes, model=None, scaler=None, state_map=None, window=WINDOW, timeframe="1m"):
     if model is None or scaler is None or state_map is None:
         try:
-            model, scaler, state_map = load_model()
+            model, scaler, state_map = load_model(timeframe)
         except (FileNotFoundError, Exception):
             return [_classify_deterministic(closes, volumes, i, window) for i in range(len(closes))]
     X_raw, valid_start = _compute_features_raw(closes, volumes, window)
@@ -152,10 +145,9 @@ def classify_sequence(closes, volumes, model=None, scaler=None, state_map=None, 
     return results
 
 
-def get_transition_matrix(model=None, state_map=None):
-    """Get learned transition matrix in ordered regime space."""
+def get_transition_matrix(model=None, state_map=None, timeframe="1m"):
     if model is None or state_map is None:
-        model, _, state_map = load_model()
+        model, _, state_map = load_model(timeframe)
     raw = model.transmat_
     n = raw.shape[0]
     ordered = np.zeros((n, n))
@@ -163,14 +155,13 @@ def get_transition_matrix(model=None, state_map=None):
     for fr in range(n):
         for to in range(n):
             ordered[fr, to] = raw[inv_map[fr], inv_map[to]]
-    return {"matrix": [[round(p, 4) for p in row] for row in ordered.tolist()],
+    return {"timeframe": timeframe, "matrix": [[round(p, 4) for p in row] for row in ordered.tolist()],
             "labels": [r["name"] for r in REGIMES]}
 
 
-def get_state_characteristics(model=None, scaler=None, state_map=None):
-    """Get learned mean/std per state in original feature space."""
+def get_state_characteristics(model=None, scaler=None, state_map=None, timeframe="1m"):
     if model is None or scaler is None or state_map is None:
-        model, scaler, state_map = load_model()
+        model, scaler, state_map = load_model(timeframe)
     inv_map = {v: k for k, v in state_map.items()}
     names = ["log_return", "realised_vol", "volume_ratio"]
     states = {}
@@ -181,11 +172,10 @@ def get_state_characteristics(model=None, scaler=None, state_map=None):
             "regime_id": rid,
             "means": {n: round(float(m), 8) for n, m in zip(names, orig_means)},
         }
-    return states
+    return {"timeframe": timeframe, "states": states}
 
 
 def _classify_deterministic(closes, volumes, idx, window=WINDOW):
-    """Fallback deterministic scorer. Used when no trained model exists."""
     if idx < window:
         return 3, 0.5
     rets = [(closes[j] - closes[j-1]) / closes[j-1]
@@ -208,29 +198,30 @@ def _classify_deterministic(closes, volumes, idx, window=WINDOW):
     return 6, min(0.95, 0.6 + abs(score) * 0.03)
 
 
-def train_from_db(symbol="BTCUSDT", neon_uri=None, limit=50000):
-    """Train HMM on data from Neon PostgreSQL."""
+def train_from_db(symbol="BTCUSDT", neon_uri=None, limit=50000, timeframe="1m"):
     import psycopg2
     if neon_uri is None:
         neon_uri = os.environ.get("NEON_URI", "")
     conn = psycopg2.connect(neon_uri)
     cur = conn.cursor()
+    table = {"1m": "candles", "1h": "candles_1h", "4h": "candles_4h"}.get(timeframe, "candles")
     if symbol == "ALL":
-        cur.execute("SELECT close, volume FROM candles WHERE interval='1m' ORDER BY open_time DESC LIMIT %s", (limit,))
+        cur.execute(f"SELECT close, volume FROM {table} WHERE interval='{timeframe}' ORDER BY open_time DESC LIMIT %s", (limit,))
     else:
-        cur.execute("SELECT close, volume FROM candles WHERE symbol=%s AND interval='1m' ORDER BY open_time DESC LIMIT %s", (symbol, limit))
+        cur.execute(f"SELECT close, volume FROM {table} WHERE symbol=%s ORDER BY open_time DESC LIMIT %s", (symbol, limit))
     rows = list(reversed(cur.fetchall()))
     cur.close(); conn.close()
-    if len(rows) < 1000:
-        return {"error": f"Not enough data: {len(rows)} candles"}
+    if len(rows) < 100:
+        return {"error": f"Not enough {timeframe} data for {symbol}: {len(rows)} candles"}
     closes = [float(r[0]) for r in rows]
     volumes = [float(r[1]) for r in rows]
     model, scaler, state_map = train(closes, volumes)
-    model_file = save_model(model, scaler, state_map)
-    chars = get_state_characteristics(model, scaler, state_map)
-    trans = get_transition_matrix(model, state_map)
+    model_file = save_model(model, scaler, state_map, timeframe)
+    chars = get_state_characteristics(model, scaler, state_map, timeframe)
+    trans = get_transition_matrix(model, state_map, timeframe)
     return {
         "status": "trained",
+        "timeframe": timeframe,
         "candles_used": len(rows),
         "symbol": symbol,
         "model_file": model_file,
@@ -246,11 +237,53 @@ def train_from_db(symbol="BTCUSDT", neon_uri=None, limit=50000):
     }
 
 
+def train_all_timeframes(symbol="BTCUSDT", neon_uri=None):
+    """Train HMMs for all three timeframes."""
+    results = {}
+    for tf, limit in [("1m", 50000), ("1h", 17000), ("4h", 4000)]:
+        try:
+            r = train_from_db(symbol=symbol, neon_uri=neon_uri, limit=limit, timeframe=tf)
+            results[tf] = r
+        except Exception as e:
+            results[tf] = {"error": str(e)}
+    return results
+
+
+def classify_all_timeframes(symbol, neon_uri=None):
+    """Get regime classification across all timeframes for a symbol."""
+    import psycopg2
+    if neon_uri is None:
+        neon_uri = os.environ.get("NEON_URI", "")
+    conn = psycopg2.connect(neon_uri)
+    cur = conn.cursor()
+    results = {}
+    for tf, table, limit in [("1m", "candles", 50), ("1h", "candles_1h", 50), ("4h", "candles_4h", 50)]:
+        try:
+            model, scaler, state_map = load_model(tf)
+        except Exception:
+            model, scaler, state_map = None, None, None
+        cur.execute(f"SELECT close, volume FROM {table} WHERE symbol=%s ORDER BY open_time DESC LIMIT %s", (symbol, limit))
+        rows = list(reversed(cur.fetchall()))
+        if len(rows) < WINDOW + 1:
+            results[tf] = {"regime": 3, "regime_name": "Neutral", "confidence": 0.0, "data_points": len(rows)}
+            continue
+        closes = [float(r[0]) for r in rows]
+        volumes = [float(r[1]) for r in rows]
+        regime, conf = classify(closes, volumes, len(rows)-1, model=model, scaler=scaler, state_map=state_map, timeframe=tf)
+        results[tf] = {"regime": regime, "regime_name": REGIMES[regime]["name"], "confidence": conf}
+    cur.close(); conn.close()
+    return results
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "train":
         symbol = sys.argv[2] if len(sys.argv) > 2 else "BTCUSDT"
-        result = train_from_db(symbol=symbol)
-        print(json.dumps(result, indent=2))
+        tf = sys.argv[3] if len(sys.argv) > 3 else "all"
+        if tf == "all":
+            results = train_all_timeframes(symbol=symbol)
+        else:
+            results = train_from_db(symbol=symbol, timeframe=tf)
+        print(json.dumps(results, indent=2))
     else:
-        print("Usage: python -m src.regime train [SYMBOL|ALL]")
+        print("Usage: python -m src.regime train [SYMBOL] [1m|1h|4h|all]")

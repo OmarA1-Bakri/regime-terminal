@@ -1,8 +1,8 @@
 """
-Regime Terminal API v2.0
+Regime Terminal API v2.1 — Multi-Timeframe HMM
 
-Real Gaussian HMM regime classification trained at startup.
-Portfolio management, paper trading, candle sync.
+Trains 1m, 1h, 4h HMMs at startup.
+All regime endpoints accept ?timeframe=1m|1h|4h (default: 4h)
 """
 import os
 import json
@@ -28,24 +28,23 @@ def get_conn():
 async def lifespan(app: FastAPI):
     logger.info("Starting Regime Terminal...")
     try:
-        from src.regime import train_from_db
-        logger.info("Training HMM on BTC data...")
-        result = train_from_db(symbol="BTCUSDT", neon_uri=NEON_URI, limit=50000)
-        if "error" in result:
-            logger.warning(f"HMM training failed: {result['error']}. Deterministic fallback.")
-        else:
-            logger.info(f"HMM trained: {result['candles_used']} candles, converged={result.get('converged')}")
+        from src.regime import train_all_timeframes
+        logger.info("Training HMMs on all timeframes...")
+        results = train_all_timeframes(symbol="BTCUSDT", neon_uri=NEON_URI)
+        for tf, r in results.items():
+            if "error" in r:
+                logger.warning(f"  {tf}: FAILED - {r['error']}")
+            else:
+                logger.info(f"  {tf}: {r['candles_used']} candles, converged={r.get('converged')}")
     except Exception as e:
         logger.warning(f"HMM training failed: {e}. Deterministic fallback.")
     yield
     logger.info("Shutting down.")
 
 
-app = FastAPI(title="Regime Terminal", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Regime Terminal", version="2.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-
-# ========== HEALTH ==========
 
 @app.get("/health")
 def health():
@@ -57,9 +56,9 @@ def health():
         total = cur.fetchone()[0]
         cur.close(); conn.close()
         from pathlib import Path
+        models = {tf: Path(f"models/hmm_regime_{tf}.pkl").exists() for tf in ["1m", "1h", "4h"]}
         return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat(),
-                "total_candles": total, "symbols": counts,
-                "hmm_trained": Path("models/hmm_regime.pkl").exists()}
+                "total_candles": total, "symbols": counts, "hmm_models": models}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -67,43 +66,51 @@ def health():
 # ========== REGIME — STATIC ROUTES FIRST ==========
 
 @app.get("/regimes")
-def regimes():
+def regimes(timeframe: str = "4h"):
     from src.regime import classify, load_model, REGIMES
     try:
-        model, scaler, state_map = load_model()
+        model, scaler, state_map = load_model(timeframe)
     except Exception:
         model, scaler, state_map = None, None, None
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT DISTINCT ON (symbol) symbol, open_time, close FROM candles ORDER BY symbol, open_time DESC")
+    table = {"1m": "candles", "1h": "candles_1h", "4h": "candles_4h"}.get(timeframe, "candles_4h")
+    cur.execute(f"SELECT DISTINCT ON (symbol) symbol, open_time, close FROM {table} ORDER BY symbol, open_time DESC")
     symbols = cur.fetchall()
     result = []
     for sym, ot, close_price in symbols:
-        cur.execute("SELECT close, volume FROM candles WHERE symbol=%s AND interval='1m' ORDER BY open_time DESC LIMIT 50", (sym,))
+        cur.execute(f"SELECT close, volume FROM {table} WHERE symbol=%s ORDER BY open_time DESC LIMIT 50", (sym,))
         rows = list(reversed(cur.fetchall()))
         closes = [float(r[0]) for r in rows]
         volumes = [float(r[1]) for r in rows]
-        regime, confidence = classify(closes, volumes, len(rows)-1, model=model, scaler=scaler, state_map=state_map)
+        regime, confidence = classify(closes, volumes, len(rows)-1, model=model, scaler=scaler, state_map=state_map, timeframe=timeframe)
         result.append({"symbol": sym, "price": close_price, "regime": regime,
                        "regime_name": REGIMES[regime]["name"], "confidence": confidence,
                        "last_update": datetime.fromtimestamp(ot / 1000, tz=timezone.utc).isoformat()})
     cur.close(); conn.close()
-    return {"regimes": result, "count": len(result)}
+    return {"timeframe": timeframe, "regimes": result, "count": len(result)}
+
+
+@app.get("/regimes/multi/{symbol}")
+def regime_multi(symbol: str):
+    """Get regime classification across all 3 timeframes for a symbol."""
+    from src.regime import classify_all_timeframes
+    return {"symbol": symbol.upper(), "timeframes": classify_all_timeframes(symbol.upper(), NEON_URI)}
 
 
 @app.get("/regimes/transitions")
-def regime_transitions():
+def regime_transitions(timeframe: str = "4h"):
     try:
         from src.regime import get_transition_matrix
-        return get_transition_matrix()
+        return get_transition_matrix(timeframe=timeframe)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/regimes/states")
-def regime_states():
+def regime_states(timeframe: str = "4h"):
     try:
         from src.regime import get_state_characteristics
-        return get_state_characteristics()
+        return get_state_characteristics(timeframe=timeframe)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -121,9 +128,11 @@ def regime_detail(symbol: str, limit: int = 1440):
 
 
 @app.post("/train")
-def train_model(symbol: str = "BTCUSDT", limit: int = 50000):
-    from src.regime import train_from_db
-    return train_from_db(symbol=symbol, neon_uri=NEON_URI, limit=limit)
+def train_model(symbol: str = "BTCUSDT", timeframe: str = "all"):
+    from src.regime import train_from_db, train_all_timeframes
+    if timeframe == "all":
+        return train_all_timeframes(symbol=symbol, neon_uri=NEON_URI)
+    return train_from_db(symbol=symbol, neon_uri=NEON_URI, timeframe=timeframe)
 
 
 @app.get("/split")
@@ -131,11 +140,11 @@ def split_info():
     SPLIT_MS = 1753833600000
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM candles WHERE open_time < %s", (SPLIT_MS,))
-    train = cur.fetchone()[0]
+    train_count = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM candles WHERE open_time >= %s", (SPLIT_MS,))
-    test = cur.fetchone()[0]
+    test_count = cur.fetchone()[0]
     cur.close(); conn.close()
-    return {"split_date": "2025-08-01", "split_ms": SPLIT_MS, "train_candles": train, "test_candles": test}
+    return {"split_date": "2025-08-01", "split_ms": SPLIT_MS, "train_candles": train_count, "test_candles": test_count}
 
 
 @app.get("/symbols")
@@ -199,7 +208,6 @@ class ClosePositionRequest(BaseModel):
     exit_price: float
     reason: Optional[str] = ""
 
-
 @app.get("/portfolio")
 def portfolio():
     from src.portfolio import get_book
@@ -257,18 +265,18 @@ def testnet_execute(symbol: str):
     from src.regime import classify, load_model
     symbol = symbol.upper()
     try:
-        model, scaler, state_map = load_model()
+        model, scaler, state_map = load_model("4h")
     except Exception:
         model, scaler, state_map = None, None, None
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT close, volume FROM candles WHERE symbol=%s AND interval='1m' ORDER BY open_time DESC LIMIT 50", (symbol,))
+    cur.execute("SELECT close, volume FROM candles_4h WHERE symbol=%s ORDER BY open_time DESC LIMIT 50", (symbol,))
     rows = list(reversed(cur.fetchall()))
     cur.close(); conn.close()
     if len(rows) < 15:
         raise HTTPException(status_code=400, detail=f"Not enough data for {symbol}")
     closes = [float(r[0]) for r in rows]
     volumes = [float(r[1]) for r in rows]
-    regime, confidence = classify(closes, volumes, len(rows)-1, model=model, scaler=scaler, state_map=state_map)
+    regime, confidence = classify(closes, volumes, len(rows)-1, model=model, scaler=scaler, state_map=state_map, timeframe="4h")
     signal = {"action": "ENTER", "side": "LONG"} if regime <= 2 else {"action": "HOLD"}
     result = execute_signal(symbol, signal) if signal.get("action") == "ENTER" else None
     return {"symbol": symbol, "regime": regime, "confidence": confidence, "signal": signal, "execution": result}
