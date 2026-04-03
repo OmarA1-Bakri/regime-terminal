@@ -1,299 +1,246 @@
 # REGIME TERMINAL — STATE OF THE UNION
-## Handoff Document for Claude Code
-### Date: 1 April 2026
+## Complete Handoff Document
+### Last Updated: 3 April 2026
 
 ---
 
-## 1. WHAT THIS SYSTEM IS
+## 1. WHAT THIS IS
 
-Regime Terminal is an autonomous crypto trading system. It uses a Gaussian Hidden Markov Model to classify market regimes across multiple timeframes, then makes trading decisions based on regime transitions. Claude Opus operates as the portfolio manager — reading market state via API, forming theses, validating trades through a dual-layer system, and executing via exchange APIs.
+Autonomous crypto trading system. Gaussian HMM classifies market regimes across 3 timeframes. Volume Profile / Point of Control confirms institutional positioning. Claude Opus operates as portfolio manager. Dual validation layer (rules engine + risk manager) gates every trade.
 
-The system is designed to be fully autonomous once deployed. Omar (the owner) sets the strategy parameters and capital allocation. Claude operates the book.
+Budget: GBP 1,000. 30% cash buffer. Up to 30% per STRONG signal with leverage.
 
 ---
 
-## 2. WHAT EXISTS AND WORKS RIGHT NOW
+## 2. WHAT WORKS RIGHT NOW
 
-### 2.1 Data — Neon PostgreSQL
+### Data
+- **18,682,811 candles** in Neon PostgreSQL (1-minute OHLCV)
+- **18 symbols:** BTC, ETH, SOL, TAO, BNB, XRP, DOGE, ADA, AVAX, DOT, LINK, RENDER, FET, NEAR, AR, INJ, SUI, PENDLE
+- **Materialized views:** candles_1h (311K rows), candles_4h (77K rows)
+- **Tables:** positions, allocations, trade_log (empty, ready for live trading)
 
-**18,681,371 candles** of 1-minute OHLCV data across 18 symbols, covering approximately 2 years (Mar 2024 — Mar 2026).
+### HMM Regime Classifier
+- Real `hmmlearn.GaussianHMM` with Baum-Welch training, Viterbi inference
+- 3 features: log returns, realised volatility, volume ratio (14-bar window)
+- 7 states: Strong Bull, Bull, Weak Bull, Neutral, Weak Bear, Bear, Crash
+- 3 separate models: 1m (execution timing), 1h (confirmation), **4h (trading decisions)**
+- Trains at Railway startup on 50K recent candles per timeframe
 
-**Symbols:** BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT, DOGEUSDT, ADAUSDT, AVAXUSDT, DOTUSDT, LINKUSDT, TAOUSDT, RENDERUSDT, FETUSDT, NEARUSDT, ARUSDT, INJUSDT, SUIUSDT, PENDLEUSDT
+### Volume Profile / Point of Control
+- POC: price with highest traded volume
+- VAH/VAL: 70% volume range (Value Area)
+- HVN/LVN: support/resistance and breakout zones
+- POC shift detection: rising = institutional accumulation, falling = distribution
+- **Combined with HMM:** regime says WHAT state, POC says WHERE in price structure
 
-**Tables:**
-- `candles` — 18.68M rows, 1-minute OHLCV + regime + confidence
-- `candles_1h` — materialized view, 311,384 rows (aggregated hourly)
-- `candles_4h` — materialized view, 77,863 rows (aggregated 4-hourly)
-- `positions` — open/closed positions with entry/exit prices, P&L, strategy tags (currently empty)
-- `allocations` — target allocation per strategy (regime=60%, tao=30%, manual=10%)
-- `trade_log` — every trade action with metadata and reasoning (currently empty)
+### ATR Module
+- 14-period Average True Range on 4h candles
+- Dynamic stop losses by symbol tier (2x/2.5x/3x ATR)
+- Trailing stops (2x ATR below highest price)
+- Pre-calculated stop levels via API
 
-**Connection:** NEON_URI is set as a Railway environment variable. Do NOT hardcode it.
+### Dual Validation
+- **Layer 1 (Rules Engine):** Python, instant, free. Checks: POC signal gating, symbol tier, ATR stop, position limits, drawdown limits, kill switch.
+- **Layer 2 (Risk Manager):** Claude Opus, ~2s. Checks: thesis coherence, correlation, timing, recent history.
+- Both must pass before any trade executes.
 
-### 2.2 Regime Classifier — Real Gaussian HMM
+### Railway Deployment
+- **URL:** https://regime-terminal-production-b43b.up.railway.app
+- **API v3.0.0** with 25+ endpoints
+- Auto-deploys on push to main
+- Env vars: NEON_URI, DRY_RUN=true, USE_TESTNET=true, testnet keys set
+- **Missing:** ANTHROPIC_API_KEY, real BINANCE_API_KEY, KRAKEN keys, TELEGRAM token
 
-**File:** `src/regime.py`
+---
 
-This is a genuine Hidden Markov Model using `hmmlearn.GaussianHMM`. It is NOT a deterministic scorer (the old version was replaced on 1 Apr 2026).
+## 3. BACKTEST RESULTS
 
-**How it works:**
-- Features: log returns, realised volatility, volume ratio (computed over a 14-bar window)
-- StandardScaler normalizes features before training (critical for convergence)
-- Baum-Welch algorithm learns transition and emission parameters from data
-- Viterbi algorithm infers the most likely state sequence
-- Posterior probabilities provide genuine probabilistic confidence
-- Covariance type: diagonal (more stable than full for this data)
+All backtests: Aug 2025 to Mar 2026 (out-of-sample). HMM trained on TRAIN data only. Binance taker fees (0.1%) + slippage (0.03-0.3%) included.
 
-**Three separate models trained, one per timeframe:**
+### v1: HMM Only (flat 5% sizing, no leverage)
 
-| Timeframe | Purpose | Training Data | Model File |
-|-----------|---------|---------------|------------|
-| 1m | Execution timing (noisy, fast) | 50K recent 1-min candles | models/hmm_regime_1m.pkl |
-| 1h | Signal confirmation | 17K recent 1-hr candles | models/hmm_regime_1h.pkl |
-| **4h** | **Primary trading decisions** | **4K recent 4-hr candles** | **models/hmm_regime_4h.pkl** |
+| Metric | Value |
+|--------|-------|
+| Avg return | -0.35% |
+| Total P&L | -$63.64 |
+| Avg win rate | 41.2% |
+| Worst drawdown | -3.67% |
+| Winners | 6/18 |
+| Trading costs | $41.61 |
 
-**7 states, ordered by mean return after training:**
-- 0: Strong Bull
-- 1: Bull
-- 2: Weak Bull
-- 3: Neutral
-- 4: Weak Bear
-- 5: Bear
-- 6: Crash
+### v1.5: HMM + POC Filter (flat 5%, no leverage)
 
-**Key learned properties (from BTC training):**
-- Bull regimes are sticky (~71-93% self-transition probability)
-- Bear regimes are very sticky (~94% self-transition)
-- Crash regimes often V-bottom into Bull (~35% Crash to Bull)
-- Neutral resolves bullish more often than bearish (~16% Neutral to Strong Bull)
+Added POC confirmation. Rejected 47% of HMM signals as low quality.
 
-**HMM trains at Railway startup** on 50K recent BTC candles per timeframe. Takes ~30 seconds. Falls back to deterministic scorer if training fails.
+| Metric | Value |
+|--------|-------|
+| Avg return | -0.10% |
+| Total P&L | -$18.45 |
+| Trades | 280 (down from 423) |
+| Worst drawdown | -2.14% |
+| Winners | 6/18 |
 
-### 2.3 Railway Deployment — LIVE
+POC signal quality: STRONG=60% WR, MEDIUM=37.5% WR, MARGINAL=23% WR.
 
-**URL:** https://regime-terminal-production-b43b.up.railway.app
-**Project:** Trading
-**Auto-deploy:** Every push to main branch triggers rebuild + deploy
+### v2: All Improvements (flat 5%, no leverage)
 
-**Environment variables set on Railway:**
-- NEON_URI (database connection)
-- DRY_RUN=true
-- USE_TESTNET=true
-- BINANCE_TESTNET_KEY (set)
-- BINANCE_TESTNET_SECRET (set)
+Added: kill MARGINAL signals, short selling, ATR stops, symbol tiers, trailing stops.
 
-**Environment variables NOT yet set (needed for full operation):**
-- ANTHROPIC_API_KEY (needed for operator.py and risk manager)
-- BINANCE_API_KEY (real account — Omar setting up)
-- BINANCE_API_SECRET
-- KRAKEN_API_KEY (not yet generated)
-- KRAKEN_API_SECRET
-- TELEGRAM_BOT_TOKEN (not yet created)
+| Metric | Value |
+|--------|-------|
+| Avg return | +0.29% |
+| Total P&L | +$52.89 |
+| Avg win rate | 56.2% |
+| Worst drawdown | -1.22% |
+| Winners | 14/18 |
+| Trades | 545 (332 long, 213 short) |
 
-### 2.4 Live API Endpoints (Verified Working)
+### v2 Aggressive: Proper Sizing + Leverage
 
-| Endpoint | Method | Status | What it returns |
-|----------|--------|--------|-----------------|
-| /health | GET | WORKS | System status, candle counts, HMM model status |
-| /regimes?timeframe=4h | GET | WORKS | All 18 symbols with HMM regime + confidence (default 4h) |
-| /regimes?timeframe=1h | GET | WORKS | Same, 1-hour timeframe |
-| /regimes?timeframe=1m | GET | WORKS | Same, 1-minute timeframe |
-| /regimes/multi/{symbol} | GET | WORKS | All 3 timeframes for one symbol |
-| /regimes/transitions?timeframe=4h | GET | WORKS | 7x7 learned transition probability matrix |
-| /regimes/states?timeframe=4h | GET | WORKS | Mean return/vol/volume per state |
-| /regimes/{symbol} | GET | WORKS | Raw candle data + stored regime for a symbol |
-| /split | GET | WORKS | Train/test split boundary (Aug 1 2025) |
-| /symbols | GET | WORKS | 18 configured trading pairs |
-| /train | POST | WORKS | Retrain HMM on demand |
-| /sync/{symbol} | POST | WORKS | Fetch latest candles from Binance |
-| /portfolio | GET | WORKS | Open positions (currently empty) |
-| /portfolio/open | POST | WORKS | Open a new position |
-| /portfolio/close/{id} | POST | WORKS | Close a position |
-| /portfolio/pnl | GET | WORKS | Realised PnL summary |
-| /portfolio/allocations | GET | WORKS | Target vs actual allocation per strategy |
-| /portfolio/history | GET | WORKS | Trade log |
-| /testnet/portfolio | GET | BLOCKED | HTTP 451 from Railway (Binance geo-blocks cloud IPs) |
-| /testnet/balance/{asset} | GET | BLOCKED | Same geo-block |
-| /testnet/execute/{symbol} | POST | BLOCKED | Same geo-block |
-| /testnet/trades | GET | WORKS | Trade log (works, currently empty) |
-| /testnet/price/{symbol} | GET | BLOCKED | Same geo-block |
+STRONG=10%, MEDIUM=5%. Leverage: Tier A STRONG=3x, MEDIUM=2x. 50% max deployment.
 
-### 2.5 Binance Testnet — Verified Working (Desktop Only)
+| Metric | Value |
+|--------|-------|
+| Avg return | +0.83% |
+| Total P&L | +$149.94 |
+| Winners | 14/18 |
+| Worst drawdown | -3.62% |
 
-**Test assets:** 462 assets (BTC 1.0, ETH 1.0, USDT 10K, TAO 2.0, etc.)
-**Launcher:** C:\Users\albak\Desktop\regime-terminal\run_testnet.bat
-**Status:** Connected and verified from desktop. Does NOT work from Railway cloud IPs.
+### v2 Full Sizing: 30% STRONG + 3x Leverage on Tier A
 
-### 2.6 GitHub Repository
+30% cash buffer. Up to 30% position on STRONG signals. Tested on Tier A only.
 
-**URL:** https://github.com/OmarA1-Bakri/regime-terminal
-**Branch:** main (auto-deploys to Railway)
+| Metric | Value |
+|--------|-------|
+| Total P&L (Tier A) | +$352.58 |
+| Avg return | +7.05% |
+| Worst drawdown | -10.64% |
 
-**Files:**
+**Tier A breakdown:**
+
+| Symbol | Return | P&L | PF | Trades |
+|--------|--------|-----|-----|--------|
+| SUI | +18.11% | $181 | 4.64 | 12 |
+| FET | +11.25% | $113 | 2.94 | 21 |
+| TAO | +4.05% | $41 | 1.51 | 16 |
+| BNB | +3.79% | $38 | 2.18 | 50 |
+| SOL | -1.95% | -$19 | 0.91 | 82 |
+
+### Key Finding
+
+Buy and hold lost -58% average over the test period. Every version of the strategy massively outperformed. The edge is:
+1. Capital preservation during bear regimes
+2. Short selling during Bear transitions (v2)
+3. POC filtering removes 47-58% of false signals
+4. Leverage on high-conviction STRONG signals amplifies winners
+5. ATR stops prevent getting knocked out on normal volatility
+
+---
+
+## 4. SYMBOL TIERS
+
+| Tier | Symbols | Sizing | Requirements |
+|------|---------|--------|-------------|
+| A | FET, SUI, TAO, SOL, BNB | Full (30% STRONG) | HMM + POC signal |
+| B | AVAX, LINK, RENDER, NEAR, XRP | Half (15% STRONG) | STRONG POC only + catalyst |
+| C | BTC, ETH, ADA, DOGE, DOT, INJ, PENDLE, AR | Quarter (7.5% STRONG) | Specific catalyst + STRONG POC |
+
+---
+
+## 5. SIGNAL RULES
+
+**Long entry:** 4h Bear to Neutral or Neutral to Bull + POC STRONG or MEDIUM.
+**Short entry:** 4h Bull to Neutral or Neutral to Bear + inverted POC (distribution at resistance).
+**Hard reject:** MARGINAL POC signals never traded. 23% win rate = guaranteed loss.
+**Stops:** ATR-based. Tier 1=2x, Tier 2=2.5x, Tier 3=3x ATR(14).
+**Trailing:** After +2x ATR profit, trail at 2x ATR below highest price.
+**Exit:** Regime reversal triggers. Both timeframes (4h primary, 1h confirm).
+
+Full rules in config/program_signals.md.
+
+---
+
+## 6. REPO STRUCTURE
 
 ```
 config/
-  program.md              — Autoresearch agent instructions (original)
-  program_portfolio.md    — Investment mandate for Claude
-  program_signals.md      — Regime transition to action mapping
-  program_risk.md         — Risk management rules, drawdown limits, kill switch
-  program_research.md     — 8-point research checklist
-  program_tao.md          — TAO strategy, subnet allocations, catalysts
-  symbols.json            — 18 trading pair configuration
+  program_portfolio.md    Investment mandate
+  program_signals.md      Entry/exit rules + POC gating + short selling
+  program_risk.md         Sizing, ATR stops, tiers, drawdown limits
+  program_research.md     8-point pre-trade checklist
+  program_tao.md          TAO/Bittensor strategy
+  symbols.json            18 trading pairs
 
 src/
-  api.py                  — FastAPI (multi-timeframe HMM, portfolio, testnet)
-  db.py                   — Neon PostgreSQL connection
-  evaluate.py             — Backtester with train/test split
-  paper_trade.py          — Binance Testnet paper trading
-  portfolio.py            — Position CRUD, PnL, allocations
-  regime.py               — 7-state Gaussian HMM (1m, 1h, 4h)
-  seasonality.py          — Significance-tested seasonal patterns
-  strategy.py             — Agent-modifiable strategy
-  validator.py            — Dual validation (rules engine + Opus risk manager)
+  api.py                  FastAPI v3.0.0 (25+ endpoints)
+  regime.py               7-state Gaussian HMM (1m, 1h, 4h)
+  volume_profile.py       POC, VAH/VAL, HVN/LVN, POC shift
+  atr.py                  ATR + dynamic stop levels
+  validator.py            Dual validation (rules engine + Opus)
+  portfolio.py            Position CRUD, P&L, allocations
+  paper_trade.py          Binance testnet
+  evaluate.py             Backtester
+  strategy.py             Agent-modifiable strategy
+  seasonality.py          Significance-tested patterns
+  db.py                   Neon connection
 
 scripts/
-  autoresearch.py         — Strategy code optimizer
+  autoresearch.py         Strategy optimizer (Sonnet mutations)
 
 bittensor/
-  tao_deploy.py           — TAO subnet staking (skeleton)
+  tao_deploy.py           TAO staking (skeleton)
 
-Dockerfile, railway.json, requirements.txt
+Dockerfile               Railway build
+railway.json             Railway config
+requirements.txt         All dependencies
 ```
 
-### 2.7 Train/Test Split
+---
 
-- TRAIN: Mar 2024 to Jul 31 2025 (~12.4M candles)
-- TEST: Aug 1 2025 to Mar 2026 (~6.3M candles)
-- Split boundary: SPLIT_MS = 1753833600000
+## 7. WHAT NEEDS BUILDING
 
-### 2.8 Budget
-
-Starting capital: GBP 1,000
-- Regime directional: 60% (GBP 600)
-- TAO staking: 30% (GBP 300)
-- Cash reserve: 10% (GBP 100)
-
-### 2.9 Current Market State (1 Apr 2026, 4h HMM)
-
-BTC: Bull 0.919 | ETH: Neutral 0.991 | SOL: Neutral 0.989
-TAO: Weak Bear 0.797 | BNB: Bear 0.998 | XRP: Bear 0.998
+| Priority | Task | Status |
+|----------|------|--------|
+| 1 | scripts/operator.py — autonomous 15-min loop | NOT BUILT |
+| 2 | src/exchange.py — unified Kraken + Binance | NOT BUILT |
+| 3 | Telegram bot for alerts | NOT BUILT |
+| 4 | Expand autoresearch to all instruction files | NOT BUILT |
+| 5 | TAO monitoring + staking execution | SKELETON |
+| 6 | TradingView webhook + Pine Script | NOT BUILT |
+| 7 | Funding rate arbitrage (when book hits GBP 3-5K) | NOT BUILT |
 
 ---
 
-## 3. ARCHITECTURE
-
-### Two Processes on Railway
-
-PROCESS 1: operator.py (every 15 min) [NOT YET BUILT]
-- Reads regime states, positions, detects transitions
-- Calls Claude Opus with instruction files + market state
-- Validates via rules engine (Python) then risk manager (Opus)
-- Executes if both pass
-
-PROCESS 2: autoresearch.py (daily) [PARTIALLY BUILT]
-- Currently only mutates strategy.py
-- Needs expansion to review ALL config/program_*.md files
-- Read trade_log, review outcomes, improve instructions, commit
-
-### Model Allocation
-
-| Component | Model |
-|-----------|-------|
-| Operator | Claude Opus |
-| Risk manager | Claude Opus |
-| Rules engine | Python (no API) |
-| Autoresearch | Claude Sonnet |
-
-### Signal Logic (4h Regime Transitions)
-
-| Transition | Action |
-|------------|--------|
-| Crash to Bear | WATCHLIST only |
-| Bear to Neutral | ENTER 50% |
-| Neutral to Bull | ENTER remaining 50% |
-| Bull to Strong Bull | HOLD, trail stop 20% |
-| Bull to Neutral | CLOSE 50% |
-| Neutral to Bear | CLOSE 100% |
-| Any to Crash | EMERGENCY EXIT |
-
-### Risk Rules
-
-- Per-trade stop: -3% | Leveraged: -2%
-- Daily drawdown: -5% stop trading
-- Weekly drawdown: -10% close all
-- Kill switch: -20% everything closed
-- Max positions: 3
-- Max leverage: 5x
-- Cash reserve: 10% minimum
-
----
-
-## 4. WHAT NEEDS BUILDING
-
-### Phase 2 (NEXT)
-1. scripts/operator.py — autonomous 15-min loop
-2. src/exchange.py — unified Kraken + Binance interface
-3. Telegram bot for alerts
-
-### Phase 3
-4. Expand autoresearch to improve ALL instruction files
-5. research_journal table in Neon
-
-### Phase 4
-6. TAO monitoring and staking execution
-7. Populate TAO Strategy Google Doc
-
-### Phase 5 (Later)
-8. TradingView webhook + Pine Script indicator
-
-### Phase 6 (When book hits GBP 3-5K)
-9. Funding rate arbitrage scanner + delta-neutral execution
-
----
-
-## 5. KNOWN ISSUES
+## 8. KNOWN ISSUES
 
 1. Binance geo-blocks Railway IPs (HTTP 451). Testnet only works from desktop.
-2. Materialized views (candles_1h, candles_4h) need manual REFRESH after syncs.
+2. Materialized views need REFRESH MATERIALIZED VIEW after syncs.
 3. Daily sync only covers BTC. All 18 symbols should sync.
-4. No ANTHROPIC_API_KEY on Railway yet.
-5. Binance real account not active (KYC in progress).
+4. No ANTHROPIC_API_KEY on Railway.
+5. Binance real account KYC in progress.
 6. Kraken API keys not generated.
-7. No Telegram bot token.
-8. HMM trains on BTC only — assumes BTC characteristics apply broadly.
-9. Shorts mapped to spot SELL in paper_trade.py (no real futures execution).
-10. Security: Desktop .env file has API keys that should be rotated post-compromise.
+7. SOL overtrades (82 trades in backtest). Needs throttling or higher entry bar.
+8. HMM trains on BTC only at startup. Per-symbol training would be more accurate.
 
 ---
 
-## 6. HOW TO OPERATE (FOR CLAUDE CODE)
+## 9. ENVIRONMENT
 
-Read ALL config/program_*.md files in the repo.
-Use the API at https://regime-terminal-production-b43b.up.railway.app
-Follow the decision process in config/program_portfolio.md.
+**Railway:** regime-terminal-production-b43b.up.railway.app (auto-deploy from main)
+**Neon:** NEON_URI in Railway env vars
+**GitHub:** github.com/OmarA1-Bakri/regime-terminal
+**Testnet:** Binance testnet keys set, 462 test assets, desktop only
+
+---
+
+## 10. FOR CLAUDE CODE
+
+Read ALL config/program_*.md files. They are your operating manual.
+Use the API at the Railway URL.
+Follow the decision process in program_portfolio.md.
 Validate every trade through src/validator.py.
 Log every decision with a thesis.
-
-### API Examples
-
-GET /regimes?timeframe=4h — primary regime states
-GET /regimes/multi/BTCUSDT — all 3 timeframes
-GET /portfolio — current positions
-POST /portfolio/open — {symbol, side, quantity, entry_price, strategy, thesis, ...}
-POST /portfolio/close/{id} — {exit_price, reason}
-
----
-
-## 7. IMMEDIATE NEXT STEPS
-
-1. Omar: Complete Binance setup (KYC + futures + API keys)
-2. Omar: Provide ANTHROPIC_API_KEY for Railway
-3. Build: scripts/operator.py
-4. Build: src/exchange.py
-5. Build: Telegram bot
-6. Test: DRY_RUN for 1 week
-7. Test: Testnet for 1 week
-8. Deploy: Live with GBP 200 initial
-9. Expand: Autoresearch for all instruction files
-10. Scale: Funding rate arb when book hits GBP 3-5K
+Never trade MARGINAL POC signals.
+Focus on Tier A symbols (FET, SUI, TAO, SOL, BNB).
+Shorts are not optional — bear markets are half the opportunity set.
