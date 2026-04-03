@@ -2,6 +2,9 @@
 models/*.pkl
 models/*.json
 
+# Cached market data
+data_cache/
+
 # Python
 __pycache__/
 *.py[cod]
