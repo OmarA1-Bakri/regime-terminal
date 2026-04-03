@@ -1,8 +1,8 @@
 """
-Regime Terminal API v2.1 — Multi-Timeframe HMM
+Regime Terminal API v2.2 — Multi-Timeframe HMM + Volume Profile
 
 Trains 1m, 1h, 4h HMMs at startup.
-All regime endpoints accept ?timeframe=1m|1h|4h (default: 4h)
+Volume Profile / POC analysis for price structure context.
 """
 import os
 import json
@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down.")
 
 
-app = FastAPI(title="Regime Terminal", version="2.1.0", lifespan=lifespan)
+app = FastAPI(title="Regime Terminal", version="2.2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -63,7 +63,7 @@ def health():
         return {"status": "error", "error": str(e)}
 
 
-# ========== REGIME — STATIC ROUTES FIRST ==========
+# ========== REGIME ==========
 
 @app.get("/regimes")
 def regimes(timeframe: str = "4h"):
@@ -92,7 +92,6 @@ def regimes(timeframe: str = "4h"):
 
 @app.get("/regimes/multi/{symbol}")
 def regime_multi(symbol: str):
-    """Get regime classification across all 3 timeframes for a symbol."""
     from src.regime import classify_all_timeframes
     return {"symbol": symbol.upper(), "timeframes": classify_all_timeframes(symbol.upper(), NEON_URI)}
 
@@ -134,6 +133,45 @@ def train_model(symbol: str = "BTCUSDT", timeframe: str = "all"):
         return train_all_timeframes(symbol=symbol, neon_uri=NEON_URI)
     return train_from_db(symbol=symbol, neon_uri=NEON_URI, timeframe=timeframe)
 
+
+# ========== VOLUME PROFILE ==========
+
+@app.get("/volume-profile/{symbol}")
+def volume_profile(symbol: str, timeframe: str = "4h", lookback: int = 100, buckets: int = 50):
+    """Full volume profile for a symbol."""
+    from src.volume_profile import get_profile_from_db
+    profile = get_profile_from_db(symbol.upper(), timeframe, lookback, buckets, NEON_URI)
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"Not enough data for {symbol}")
+    return {"symbol": symbol.upper(), "timeframe": timeframe, "lookback": lookback, "profile": profile}
+
+
+@app.get("/volume-profile/{symbol}/poc")
+def volume_profile_poc(symbol: str, timeframe: str = "4h", lookback: int = 100):
+    """POC, VAH, VAL summary for a symbol."""
+    from src.volume_profile import get_profile_from_db
+    profile = get_profile_from_db(symbol.upper(), timeframe, lookback, neon_uri=NEON_URI)
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"Not enough data for {symbol}")
+    return {
+        "symbol": symbol.upper(), "timeframe": timeframe,
+        "poc": profile["poc"], "vah": profile["vah"], "val": profile["val"],
+        "total_volume": profile["total_volume"],
+        "hvn": profile["hvn"][:5], "lvn": profile["lvn"][:5]
+    }
+
+
+@app.get("/volume-profile/{symbol}/analysis")
+def volume_profile_analysis(symbol: str, timeframe: str = "4h", lookback: int = 100):
+    """Full POC analysis: profile + price position + POC shift."""
+    from src.volume_profile import get_poc_analysis
+    result = get_poc_analysis(symbol.upper(), timeframe, lookback, NEON_URI)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+# ========== UTILITY ==========
 
 @app.get("/split")
 def split_info():
