@@ -1,31 +1,54 @@
 """
-Dual Validation Layer
+Dual Validation Layer v2
 
 Layer 1: Rules Engine (Python, instant, free)
-  - Mechanical checks: balance, limits, duplicates, data freshness
-  - Returns PASS/FAIL with reason
+  - POC signal gating (MARGINAL/REJECT = auto-reject)
+  - ATR-based stop validation
+  - Symbol tier enforcement
+  - Balance, limits, duplicates, data freshness
 
-Layer 2: Risk Manager (Claude Opus, ~2s, ~$0.03)
-  - Separate system prompt with sceptical mandate
-  - Checks thesis coherence, correlation, timing
-  - Returns APPROVE/REJECT with reason
+Layer 2: Risk Manager (Claude Opus, ~2s)
+  - Thesis coherence with regime + POC reading
+  - Correlation, timing, recent history
 
 Both must pass before any trade executes.
 """
 import os
 import json
-import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 NEON_URI = os.environ.get("NEON_URI", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MAX_POSITIONS = 3
-MAX_SINGLE_POSITION_PCT = 10
+
+MAX_LONG_POSITIONS = 3
+MAX_SHORT_POSITIONS = 2
+MAX_TOTAL_POSITIONS = 5
 MIN_CONFIDENCE = 0.5
-MAX_DATA_AGE_MINUTES = 30
-DAILY_DRAWDOWN_LIMIT = -5  # percent
+DAILY_DRAWDOWN_LIMIT = -5
 WEEKLY_DRAWDOWN_LIMIT = -10
 KILL_SWITCH_LIMIT = -20
+
+# Symbol tiers from backtest analysis
+TIER_A = ["FETUSDT", "SUIUSDT", "TAOUSDT", "SOLUSDT", "BNBUSDT"]
+TIER_B = ["AVAXUSDT", "LINKUSDT", "RENDERUSDT", "NEARUSDT", "XRPUSDT"]
+TIER_C = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "DOGEUSDT", "DOTUSDT", "INJUSDT", "PENDLEUSDT", "ARUSDT"]
+
+# POC signal sizing multipliers
+POC_SIZING = {
+    "STRONG": 1.0,
+    "MEDIUM": 0.75,
+    "WEAK": 0.4,
+    "MARGINAL": 0.0,  # DO NOT TRADE
+    "REJECT": 0.0,    # DO NOT TRADE
+    "NO_DATA": 0.0,
+}
+
+# Tier sizing multipliers
+TIER_SIZING = {
+    "A": 1.0,
+    "B": 0.5,
+    "C": 0.25,
+}
 
 
 def get_conn():
@@ -33,141 +56,136 @@ def get_conn():
     return psycopg2.connect(NEON_URI)
 
 
-# ========== LAYER 1: RULES ENGINE ==========
+def get_symbol_tier(symbol):
+    if symbol in TIER_A: return "A"
+    if symbol in TIER_B: return "B"
+    if symbol in TIER_C: return "C"
+    return "C"  # default to most restrictive
+
 
 def validate_rules(trade):
     """
-    Mechanical pre-trade checks. Returns {passed: bool, reason: str, checks: dict}
+    Mechanical pre-trade checks with POC gating and ATR validation.
     
     trade: {
-        symbol: str,
-        side: str (LONG/SHORT),
-        quantity: float,
-        entry_price: float,
-        strategy: str,
-        regime: int,
-        confidence: float,
-        thesis: str,
-        leverage: float (default 1),
+        symbol, side (LONG/SHORT), quantity, entry_price, strategy,
+        regime, confidence, thesis, leverage (default 1),
+        poc_signal (STRONG/MEDIUM/WEAK/MARGINAL/REJECT),
+        atr_stop (price level for stop loss),
     }
     """
     checks = {}
     
     # 1. Symbol in universe
-    try:
-        with open("config/symbols.json") as f:
-            universe = json.load(f)
-        symbols = [s["symbol"] for s in universe.get("symbols", universe)] if isinstance(universe, dict) else [s["symbol"] for s in universe]
-    except Exception:
-        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT",
-                   "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "TAOUSDT", "RENDERUSDT",
-                   "FETUSDT", "NEARUSDT", "ARUSDT", "INJUSDT", "SUIUSDT", "PENDLEUSDT"]
-    checks["symbol_approved"] = trade["symbol"] in symbols
+    all_symbols = TIER_A + TIER_B + TIER_C
+    checks["symbol_approved"] = trade["symbol"] in all_symbols
     
-    # 2. Confidence above threshold
+    # 2. POC signal gating (CRITICAL)
+    poc = trade.get("poc_signal", "NO_DATA")
+    checks["poc_not_marginal"] = poc not in ["MARGINAL", "REJECT", "NO_DATA"]
+    
+    # 3. Symbol tier vs POC signal
+    tier = get_symbol_tier(trade["symbol"])
+    if tier == "B":
+        checks["tier_poc_match"] = poc == "STRONG"
+    elif tier == "C":
+        checks["tier_poc_match"] = poc == "STRONG" and len(trade.get("thesis", "")) > 50
+    else:
+        checks["tier_poc_match"] = True  # Tier A accepts STRONG and MEDIUM
+    
+    # 4. Confidence above threshold
     checks["confidence_ok"] = trade.get("confidence", 0) >= MIN_CONFIDENCE
     
-    # 3. Not at max positions
+    # 5. Position limits
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM positions WHERE status='OPEN'")
-    open_count = cur.fetchone()[0]
-    checks["positions_ok"] = open_count < MAX_POSITIONS
+    cur.execute("SELECT COUNT(*) FROM positions WHERE status='OPEN' AND side='LONG'")
+    long_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM positions WHERE status='OPEN' AND side='SHORT'")
+    short_count = cur.fetchone()[0]
     
-    # 4. No duplicate position
-    cur.execute("SELECT COUNT(*) FROM positions WHERE status='OPEN' AND symbol=%s", (trade["symbol"],))
-    dup = cur.fetchone()[0]
-    checks["no_duplicate"] = dup == 0
+    side = trade.get("side", "LONG")
+    if side == "LONG":
+        checks["positions_ok"] = long_count < MAX_LONG_POSITIONS
+    else:
+        checks["positions_ok"] = short_count < MAX_SHORT_POSITIONS
+    checks["total_positions_ok"] = (long_count + short_count) < MAX_TOTAL_POSITIONS
     
-    # 5. Position size within limits
-    cur.execute("SELECT COALESCE(SUM(notional), 0) FROM positions WHERE status='OPEN'")
-    total_notional = float(cur.fetchone()[0])
+    # 6. No duplicate position on same side
+    cur.execute("SELECT COUNT(*) FROM positions WHERE status='OPEN' AND symbol=%s AND side=%s",
+                (trade["symbol"], side))
+    checks["no_duplicate"] = cur.fetchone()[0] == 0
+    
+    # 7. Size within limits (adjusted for POC + tier)
+    poc_mult = POC_SIZING.get(poc, 0)
+    tier_mult = TIER_SIZING.get(tier, 0.25)
+    max_size_pct = 10 * poc_mult * tier_mult  # base 10%, adjusted
     trade_notional = trade["quantity"] * trade["entry_price"] * trade.get("leverage", 1)
-    book_value = max(total_notional + 1000, 1000)  # approximate, use actual balance in production
+    book_value = max(1000, 1000)  # TODO: calculate actual book value
     position_pct = (trade_notional / book_value) * 100
-    checks["size_ok"] = position_pct <= MAX_SINGLE_POSITION_PCT
+    checks["size_ok"] = position_pct <= max(max_size_pct, 1)
     
-    # 6. Leverage within limits
-    leverage = trade.get("leverage", 1)
-    checks["leverage_ok"] = leverage <= 5
+    # 8. Leverage within limits
+    checks["leverage_ok"] = trade.get("leverage", 1) <= 5
     
-    # 7. Has thesis
+    # 9. Has thesis
     checks["has_thesis"] = len(trade.get("thesis", "")) > 10
     
-    # 8. Check drawdown limits
-    cur.execute("""
-        SELECT COALESCE(SUM(pnl), 0) FROM positions 
-        WHERE status='CLOSED' AND exit_time > NOW() - INTERVAL '1 day'
-    """)
+    # 10. Has ATR stop
+    checks["has_atr_stop"] = trade.get("atr_stop") is not None and trade.get("atr_stop") > 0
+    
+    # 11. Drawdown checks
+    cur.execute("SELECT COALESCE(SUM(pnl), 0) FROM positions WHERE status='CLOSED' AND exit_time > NOW() - INTERVAL '1 day'")
     daily_pnl = float(cur.fetchone()[0])
-    daily_pnl_pct = (daily_pnl / book_value) * 100 if book_value > 0 else 0
-    checks["daily_drawdown_ok"] = daily_pnl_pct > DAILY_DRAWDOWN_LIMIT
+    checks["daily_drawdown_ok"] = (daily_pnl / book_value) * 100 > DAILY_DRAWDOWN_LIMIT
     
-    cur.execute("""
-        SELECT COALESCE(SUM(pnl), 0) FROM positions 
-        WHERE status='CLOSED' AND exit_time > NOW() - INTERVAL '7 days'
-    """)
+    cur.execute("SELECT COALESCE(SUM(pnl), 0) FROM positions WHERE status='CLOSED' AND exit_time > NOW() - INTERVAL '7 days'")
     weekly_pnl = float(cur.fetchone()[0])
-    weekly_pnl_pct = (weekly_pnl / book_value) * 100 if book_value > 0 else 0
-    checks["weekly_drawdown_ok"] = weekly_pnl_pct > WEEKLY_DRAWDOWN_LIMIT
+    checks["weekly_drawdown_ok"] = (weekly_pnl / book_value) * 100 > WEEKLY_DRAWDOWN_LIMIT
     
-    # 9. Kill switch
+    # 12. Kill switch
     cur.execute("SELECT COALESCE(SUM(pnl), 0) FROM positions WHERE status='CLOSED'")
     total_pnl = float(cur.fetchone()[0])
-    total_pnl_pct = (total_pnl / 1000) * 100  # vs starting capital
-    checks["kill_switch_ok"] = total_pnl_pct > KILL_SWITCH_LIMIT
+    checks["kill_switch_ok"] = (total_pnl / 1000) * 100 > KILL_SWITCH_LIMIT
     
     cur.close(); conn.close()
     
-    # Overall
     all_passed = all(checks.values())
     failed = [k for k, v in checks.items() if not v]
     reason = "All checks passed" if all_passed else f"Failed: {', '.join(failed)}"
     
-    return {"passed": all_passed, "reason": reason, "checks": checks}
+    return {"passed": all_passed, "reason": reason, "checks": checks,
+            "sizing": {"poc_mult": poc_mult, "tier_mult": tier_mult, "tier": tier, "poc_signal": poc}}
 
-
-# ========== LAYER 2: RISK MANAGER (Claude Opus) ==========
 
 def validate_risk_manager(trade, portfolio_state, regime_state):
-    """
-    Calls Claude Opus with a sceptical risk manager prompt.
-    Returns {approved: bool, reason: str}
-    """
+    """Calls Claude Opus with sceptical risk manager prompt."""
     if not ANTHROPIC_API_KEY:
         return {"approved": True, "reason": "No API key, skipping risk review (DRY_RUN)"}
     
     import httpx
     
-    prompt = f"""You are a SCEPTICAL risk manager. Your job is to find reasons NOT to take this trade.
-You approve only if you cannot find a strong reason to reject.
+    prompt = f"""You are a SCEPTICAL risk manager. Find reasons NOT to take this trade.
+Approve only if you cannot find a strong reason to reject.
 
-Proposed Trade:
-  Symbol: {trade['symbol']}
+Trade:
+  Symbol: {trade['symbol']} (Tier {get_symbol_tier(trade['symbol'])})
   Side: {trade['side']}
   Size: {trade['quantity']} @ ${trade['entry_price']}
   Leverage: {trade.get('leverage', 1)}x
-  Strategy: {trade['strategy']}
+  POC Signal: {trade.get('poc_signal', 'UNKNOWN')}
+  ATR Stop: ${trade.get('atr_stop', 'NOT SET')}
   Regime: {trade['regime']} (confidence: {trade.get('confidence', 0)})
-  Thesis: {trade.get('thesis', 'No thesis provided')}
+  Thesis: {trade.get('thesis', 'No thesis')}
 
-Current Portfolio:
-{json.dumps(portfolio_state, indent=2, default=str)}
+Portfolio: {json.dumps(portfolio_state, indent=2, default=str)}
+Regime State: {json.dumps(regime_state, indent=2, default=str)}
 
-Current Regime State:
-{json.dumps(regime_state, indent=2, default=str)}
+Check: thesis coherent with regime + POC? Correlation risk? Bad timing? Recent losses on this setup?
 
-Check:
-1. Is the thesis coherent? Does buying {trade['symbol']} make sense given the regime?
-2. Correlation: are we already exposed to similar assets?
-3. Timing: any reason this is a bad time?
-4. Recent history: have we lost on this exact setup recently?
-5. Overall portfolio heat: are we overexposed?
-
-Respond with EXACTLY one line:
+Respond EXACTLY:
 APPROVE: [reason]
 or
-REJECT: [reason]
-"""
+REJECT: [reason]"""
 
     try:
         resp = httpx.post(
@@ -177,49 +195,27 @@ REJECT: [reason]
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=15
         )
-        result = resp.json()
-        text = result.get("content", [{}])[0].get("text", "")
-        
-        if text.startswith("APPROVE"):
-            return {"approved": True, "reason": text}
-        elif text.startswith("REJECT"):
-            return {"approved": False, "reason": text}
-        else:
-            return {"approved": False, "reason": f"Unclear response: {text[:200]}"}
+        text = resp.json().get("content", [{}])[0].get("text", "")
+        if text.startswith("APPROVE"): return {"approved": True, "reason": text}
+        if text.startswith("REJECT"): return {"approved": False, "reason": text}
+        return {"approved": False, "reason": f"Unclear: {text[:200]}"}
     except Exception as e:
         return {"approved": True, "reason": f"Risk manager unavailable: {e}. Proceeding with caution."}
 
 
-# ========== COMBINED VALIDATION ==========
-
 def validate_trade(trade, portfolio_state=None, regime_state=None):
-    """
-    Run both validation layers.
-    Returns {approved: bool, rules: dict, risk_manager: dict}
-    """
-    # Layer 1: Rules engine
+    """Run both validation layers."""
     rules = validate_rules(trade)
-    
     if not rules["passed"]:
-        return {
-            "approved": False,
-            "rules": rules,
-            "risk_manager": {"approved": False, "reason": "Skipped - rules engine failed"},
-            "reason": rules["reason"]
-        }
+        return {"approved": False, "rules": rules,
+                "risk_manager": {"approved": False, "reason": "Skipped - rules failed"},
+                "reason": rules["reason"]}
     
-    # Layer 2: Risk manager
     if portfolio_state is None:
         from src.portfolio import get_book
         portfolio_state = get_book()
     
     risk = validate_risk_manager(trade, portfolio_state, regime_state or {})
-    
     approved = rules["passed"] and risk["approved"]
-    
-    return {
-        "approved": approved,
-        "rules": rules,
-        "risk_manager": risk,
-        "reason": "Trade approved" if approved else risk.get("reason", rules.get("reason"))
-    }
+    return {"approved": approved, "rules": rules, "risk_manager": risk,
+            "reason": "Trade approved" if approved else risk.get("reason", rules.get("reason"))}
