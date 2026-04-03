@@ -1,8 +1,9 @@
 """
-Regime Terminal API v2.2 — Multi-Timeframe HMM + Volume Profile
+Regime Terminal API v3.0.0 — Multi-Timeframe HMM + Volume Profile + ATR
 
 Trains 1m, 1h, 4h HMMs at startup.
 Volume Profile / POC analysis for price structure context.
+ATR-based dynamic stop losses.
 """
 import os
 import json
@@ -42,7 +43,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down.")
 
 
-app = FastAPI(title="Regime Terminal", version="2.2.0", lifespan=lifespan)
+app = FastAPI(title="Regime Terminal", version="3.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -138,7 +139,6 @@ def train_model(symbol: str = "BTCUSDT", timeframe: str = "all"):
 
 @app.get("/volume-profile/{symbol}")
 def volume_profile(symbol: str, timeframe: str = "4h", lookback: int = 100, buckets: int = 50):
-    """Full volume profile for a symbol."""
     from src.volume_profile import get_profile_from_db
     profile = get_profile_from_db(symbol.upper(), timeframe, lookback, buckets, NEON_URI)
     if not profile:
@@ -148,27 +148,41 @@ def volume_profile(symbol: str, timeframe: str = "4h", lookback: int = 100, buck
 
 @app.get("/volume-profile/{symbol}/poc")
 def volume_profile_poc(symbol: str, timeframe: str = "4h", lookback: int = 100):
-    """POC, VAH, VAL summary for a symbol."""
     from src.volume_profile import get_profile_from_db
     profile = get_profile_from_db(symbol.upper(), timeframe, lookback, neon_uri=NEON_URI)
     if not profile:
         raise HTTPException(status_code=404, detail=f"Not enough data for {symbol}")
-    return {
-        "symbol": symbol.upper(), "timeframe": timeframe,
-        "poc": profile["poc"], "vah": profile["vah"], "val": profile["val"],
-        "total_volume": profile["total_volume"],
-        "hvn": profile["hvn"][:5], "lvn": profile["lvn"][:5]
-    }
+    return {"symbol": symbol.upper(), "timeframe": timeframe,
+            "poc": profile["poc"], "vah": profile["vah"], "val": profile["val"],
+            "total_volume": profile["total_volume"], "hvn": profile["hvn"][:5], "lvn": profile["lvn"][:5]}
 
 
 @app.get("/volume-profile/{symbol}/analysis")
 def volume_profile_analysis(symbol: str, timeframe: str = "4h", lookback: int = 100):
-    """Full POC analysis: profile + price position + POC shift."""
     from src.volume_profile import get_poc_analysis
     result = get_poc_analysis(symbol.upper(), timeframe, lookback, NEON_URI)
     if "error" in result:
         raise HTTPException(status_code=404, detail=result["error"])
     return result
+
+
+# ========== ATR ==========
+
+@app.get("/atr/{symbol}")
+def atr_endpoint(symbol: str, timeframe: str = "4h", period: int = 14):
+    """ATR with stop loss levels for all tiers."""
+    from src.atr import get_current_atr
+    result = get_current_atr(symbol.upper(), timeframe, period, NEON_URI)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+@app.get("/atr")
+def atr_all(timeframe: str = "4h", period: int = 14):
+    """ATR for all symbols."""
+    from src.atr import get_atr_all_symbols
+    return get_atr_all_symbols(timeframe, period, NEON_URI)
 
 
 # ========== UTILITY ==========
@@ -208,8 +222,7 @@ def sync_symbol(symbol: str, days_back: int = 1):
     raw = resp.json()
     if not raw:
         return {"symbol": symbol, "fetched": 0}
-    closes = [float(k[4]) for k in raw]
-    volumes = [float(k[5]) for k in raw]
+    closes = [float(k[4]) for k in raw]; volumes = [float(k[5]) for k in raw]
     buf = StringIO()
     for i, k in enumerate(raw):
         r, cf = classify(closes, volumes, i)
@@ -312,8 +325,7 @@ def testnet_execute(symbol: str):
     cur.close(); conn.close()
     if len(rows) < 15:
         raise HTTPException(status_code=400, detail=f"Not enough data for {symbol}")
-    closes = [float(r[0]) for r in rows]
-    volumes = [float(r[1]) for r in rows]
+    closes = [float(r[0]) for r in rows]; volumes = [float(r[1]) for r in rows]
     regime, confidence = classify(closes, volumes, len(rows)-1, model=model, scaler=scaler, state_map=state_map, timeframe="4h")
     signal = {"action": "ENTER", "side": "LONG"} if regime <= 2 else {"action": "HOLD"}
     result = execute_signal(symbol, signal) if signal.get("action") == "ENTER" else None
