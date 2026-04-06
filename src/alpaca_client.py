@@ -16,8 +16,8 @@ from datetime import datetime, timezone
 BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 DATA_URL = "https://data.alpaca.markets"
 
-API_KEY = os.getenv("ALPACA_API_KEY", "")
-API_SECRET = os.getenv("ALPACA_API_SECRET", "")
+API_KEY = os.getenv("ALPACA_API_KEY", "PKWY36S4PNQFCQDTWSFHNTVARA")
+API_SECRET = os.getenv("ALPACA_API_SECRET", "A8uY6N5fahU5k32z26ZLoy9ViwXKNkqBLb29kMLm9ZfC")
 
 
 def _headers():

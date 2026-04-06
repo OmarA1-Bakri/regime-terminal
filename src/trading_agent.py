@@ -86,27 +86,34 @@ def fetch_stock_bars(symbol, days=120):
 def fetch_crypto_bars(symbol, days=120):
     """Fetch daily bars from Railway API (Neon data)."""
     try:
+        # Need ~1440 1m candles per day; cap at 10 days to avoid timeout
+        fetch_days = min(days, 10)
         r = httpx.get(f"{RAILWAY_URL}/regimes/{symbol}",
-                      params={"limit": days * 24 * 60}, timeout=30)
+                      params={"limit": fetch_days * 1440}, timeout=60)
         if r.status_code != 200:
             return []
         data = r.json()
-        # Aggregate 1m candles to daily
+        # Aggregate 1m candles to daily (API uses short keys: t,o,h,l,c,v)
         daily = {}
         for c in data.get("candles", []):
-            day_key = c["open_time"] // 86400000
+            ts = c.get("t", c.get("open_time", 0))
+            day_key = ts // 86400000
+            o = c.get("o", c.get("open", 0))
+            h = c.get("h", c.get("high", 0))
+            l = c.get("l", c.get("low", 0))
+            cl = c.get("c", c.get("close", 0))
+            v = c.get("v", c.get("volume", 0))
             if day_key not in daily:
                 daily[day_key] = {
                     "t": day_key * 86400000,
-                    "o": c["open"], "h": c["high"],
-                    "l": c["low"], "c": c["close"], "v": c["volume"],
+                    "o": o, "h": h, "l": l, "c": cl, "v": v,
                 }
             else:
                 d = daily[day_key]
-                d["h"] = max(d["h"], c["high"])
-                d["l"] = min(d["l"], c["low"])
-                d["c"] = c["close"]
-                d["v"] += c["volume"]
+                d["h"] = max(d["h"], h)
+                d["l"] = min(d["l"], l)
+                d["c"] = cl
+                d["v"] += v
         candles = []
         for d in sorted(daily.values(), key=lambda x: x["t"]):
             candles.append([d["t"], d["o"], d["h"], d["l"], d["c"], d["v"]])
