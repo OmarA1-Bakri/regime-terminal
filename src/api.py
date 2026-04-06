@@ -337,6 +337,72 @@ def testnet_price(symbol: str):
     return {"symbol": symbol.upper(), "price": get_price(symbol.upper())}
 
 
+# ── Trading Agent Endpoints ──────────────────────────────────────────
+
+@app.post("/agent/run")
+def agent_run_cycle():
+    """Run a single trading agent analysis cycle."""
+    from src.trading_agent import run_once
+    return run_once()
+
+@app.get("/agent/signals/{symbol}")
+def agent_signals(symbol: str):
+    """Get multi-factor signals for a symbol."""
+    from src.multi_factor_strategy import SignalEngine
+    from src.trading_agent import fetch_stock_bars, fetch_crypto_bars
+    from src.exchange_router import is_crypto
+
+    engine = SignalEngine()
+    if is_crypto(symbol.upper()):
+        candles = fetch_crypto_bars(symbol.upper())
+    else:
+        candles = fetch_stock_bars(symbol.upper())
+
+    if not candles or len(candles) < 60:
+        raise HTTPException(status_code=400, detail=f"Not enough data for {symbol}")
+
+    closes = [c[4] for c in candles]
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    volumes = [c[5] for c in candles]
+    signals = engine.compute_signals(closes, highs, lows, volumes)
+
+    # Return last 5 signals
+    recent = [s for s in signals[-5:] if s["regime"] != "warmup"]
+    return {
+        "symbol": symbol.upper(),
+        "latest": signals[-1],
+        "recent": recent,
+        "candle_count": len(candles),
+    }
+
+@app.get("/agent/portfolio")
+def agent_portfolio():
+    """Get combined portfolio across all exchanges."""
+    from src.exchange_router import get_portfolio, get_total_equity
+    return {
+        "portfolio": get_portfolio(),
+        "total_equity": get_total_equity(),
+    }
+
+@app.get("/agent/status")
+def agent_status():
+    """Get trading agent configuration and status."""
+    from src.trading_agent import (
+        STOCK_SYMBOLS, CRYPTO_SYMBOLS, DRY_RUN,
+        LOOP_INTERVAL, MAX_POSITIONS, CONVICTION_THRESHOLD,
+    )
+    return {
+        "dry_run": DRY_RUN,
+        "loop_interval": LOOP_INTERVAL,
+        "max_positions": MAX_POSITIONS,
+        "conviction_threshold": CONVICTION_THRESHOLD,
+        "stock_universe": STOCK_SYMBOLS,
+        "crypto_universe": CRYPTO_SYMBOLS,
+        "total_symbols": len(STOCK_SYMBOLS) + len(CRYPTO_SYMBOLS),
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
